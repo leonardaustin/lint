@@ -10,6 +10,7 @@ Golint is a linter for Go source code.
 ## Installation
 
 Golint requires Go 1.5 or later.
+
     go get -u github.com/leonardaustin/lint/golint
 
 
