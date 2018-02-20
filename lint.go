@@ -8,6 +8,7 @@
 package lint
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"go/ast"
@@ -22,7 +23,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"golang.org/x/tools/go/gcimporter15"
+	"golang.org/x/tools/go/gcexportdata"
 )
 
 const styleGuideBase = "https://golang.org/wiki/CodeReviewComments"
@@ -81,15 +82,15 @@ func (l *Linter) Lint(filename string, src []byte) ([]Problem, error) {
 // LintFiles lints a set of files of a single package.
 // The argument is a map of filename to source.
 func (l *Linter) LintFiles(files map[string][]byte) ([]Problem, error) {
-	if len(files) == 0 {
-		return nil, nil
-	}
 	pkg := &pkg{
 		fset:  token.NewFileSet(),
 		files: make(map[string]*file),
 	}
 	var pkgName string
 	for filename, src := range files {
+		if isGenerated(src) {
+			continue // See issue #239
+		}
 		f, err := parser.ParseFile(pkg.fset, filename, src, parser.ParseComments)
 		if err != nil {
 			return nil, err
@@ -107,7 +108,28 @@ func (l *Linter) LintFiles(files map[string][]byte) ([]Problem, error) {
 			filename: filename,
 		}
 	}
+	if len(pkg.files) == 0 {
+		return nil, nil
+	}
 	return pkg.lint(), nil
+}
+
+var (
+	genHdr = []byte("// Code generated ")
+	genFtr = []byte(" DO NOT EDIT.")
+)
+
+// isGenerated reports whether the source file is generated code
+// according the rules from https://golang.org/s/generatedcode.
+func isGenerated(src []byte) bool {
+	sc := bufio.NewScanner(bytes.NewReader(src))
+	for sc.Scan() {
+		b := sc.Bytes()
+		if bytes.HasPrefix(b, genHdr) && bytes.HasSuffix(b, genFtr) && len(b) >= len(genHdr)+len(genFtr) {
+			return true
+		}
+	}
+	return false
 }
 
 // pkg represents a package being linted.
@@ -177,6 +199,7 @@ func (f *file) lint() {
 	f.lintNames()
 	f.lintVarDecls()
 	f.lintElses()
+	f.lintIfError()
 	f.lintRanges()
 	f.lintErrorf()
 	f.lintErrors()
@@ -235,30 +258,15 @@ argLoop:
 	return &p.problems[len(p.problems)-1]
 }
 
-var gcImporter = gcimporter.Import
-
-// importer implements go/types.Importer{,From}.
-type importer struct {
-	impFn    func(packages map[string]*types.Package, path, srcDir string) (*types.Package, error)
-	packages map[string]*types.Package
-}
-
-func (i importer) Import(path string) (*types.Package, error) {
-	return i.impFn(i.packages, path, "")
-}
-
-func (i importer) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.Package, error) {
-	return i.impFn(i.packages, path, srcDir)
+var newImporter = func(fset *token.FileSet) types.ImporterFrom {
+	return gcexportdata.NewImporter(fset, make(map[string]*types.Package))
 }
 
 func (p *pkg) typeCheck() error {
 	config := &types.Config{
 		// By setting a no-op error reporter, the type checker does as much work as possible.
-		Error: func(error) {},
-		Importer: importer{
-			impFn:    gcImporter,
-			packages: make(map[string]*types.Package),
-		},
+		Error:    func(error) {},
+		Importer: newImporter(p.fset),
 	}
 	info := &types.Info{
 		Types:  make(map[ast.Expr]types.TypeAndValue),
@@ -454,7 +462,6 @@ func (f *file) lintBlankImports() {
 
 // lintImports examines import blocks.
 func (f *file) lintImports() {
-
 	for i, is := range f.f.Imports {
 		_ = i
 		if is.Name != nil && is.Name.Name == "." && !f.isTest() {
@@ -462,7 +469,6 @@ func (f *file) lintImports() {
 		}
 
 	}
-
 }
 
 const docCommentsLink = styleGuideBase + "#doc-comments"
@@ -561,6 +567,7 @@ func (f *file) lintNames() {
 		if id.Name == should {
 			return
 		}
+
 		if len(id.Name) > 2 && strings.Contains(id.Name[1:], "_") {
 			f.errorf(id, 0.9, link("http://golang.org/doc/effective_go.html#mixed-caps"), category("naming"), "don't use underscores in Go names; %s %s should be %s", thing, id.Name, should)
 			return
@@ -598,7 +605,12 @@ func (f *file) lintNames() {
 				thing = "method"
 			}
 
-			check(v.Name, thing)
+			// Exclude naming warnings for functions that are exported to C but
+			// not exported in the Go API.
+			// See https://github.com/golang/lint/issues/144.
+			if ast.IsExported(v.Name.Name) || !isCgoExported(v) {
+				check(v.Name, thing)
+			}
 
 			checkList(v.Type.Params, thing+" parameter")
 			checkList(v.Type.Results, thing+" result")
@@ -1226,7 +1238,7 @@ func (f *file) lintReceiverNames() {
 		name := names[0].Name
 		const ref = styleGuideBase + "#receiver-names"
 		if name == "_" {
-			f.errorf(n, 1, link(ref), category("naming"), `receiver name should not be an underscore`)
+			f.errorf(n, 1, link(ref), category("naming"), `receiver name should not be an underscore, omit the name if it is unused`)
 			return true
 		}
 		if name == "this" || name == "self" {
@@ -1429,7 +1441,7 @@ func (f *file) checkContextKeyType(x *ast.CallExpr) {
 	}
 	key := f.pkg.typesInfo.Types[x.Args[1]]
 
-	if _, ok := key.Type.(*types.Basic); ok {
+	if ktyp, ok := key.Type.(*types.Basic); ok && ktyp.Kind() != types.Invalid {
 		f.errorf(x, 1.0, category("context"), fmt.Sprintf("should not use basic type %s as key in context.WithValue", key.Type))
 	}
 }
@@ -1449,6 +1461,85 @@ func (f *file) lintContextArgs() {
 			if isPkgDot(arg.Type, "context", "Context") {
 				f.errorf(fn, 0.9, link("https://golang.org/pkg/context/"), category("arg-order"), "context.Context should be the first parameter of a function")
 				break // only flag one
+			}
+		}
+		return true
+	})
+}
+
+// containsComments returns whether the interval [start, end) contains any
+// comments without "// MATCH " prefix.
+func (f *file) containsComments(start, end token.Pos) bool {
+	for _, cgroup := range f.f.Comments {
+		comments := cgroup.List
+		if comments[0].Slash >= end {
+			// All comments starting with this group are after end pos.
+			return false
+		}
+		if comments[len(comments)-1].Slash < start {
+			// Comments group ends before start pos.
+			continue
+		}
+		for _, c := range comments {
+			if start <= c.Slash && c.Slash < end && !strings.HasPrefix(c.Text, "// MATCH ") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (f *file) lintIfError() {
+	f.walk(func(node ast.Node) bool {
+		switch v := node.(type) {
+		case *ast.BlockStmt:
+			for i := 0; i < len(v.List)-1; i++ {
+				// if var := whatever; var != nil { return var }
+				s, ok := v.List[i].(*ast.IfStmt)
+				if !ok || s.Body == nil || len(s.Body.List) != 1 || s.Else != nil {
+					continue
+				}
+				assign, ok := s.Init.(*ast.AssignStmt)
+				if !ok || len(assign.Lhs) != 1 || !(assign.Tok == token.DEFINE || assign.Tok == token.ASSIGN) {
+					continue
+				}
+				id, ok := assign.Lhs[0].(*ast.Ident)
+				if !ok {
+					continue
+				}
+				expr, ok := s.Cond.(*ast.BinaryExpr)
+				if !ok || expr.Op != token.NEQ {
+					continue
+				}
+				if lhs, ok := expr.X.(*ast.Ident); !ok || lhs.Name != id.Name {
+					continue
+				}
+				if rhs, ok := expr.Y.(*ast.Ident); !ok || rhs.Name != "nil" {
+					continue
+				}
+				r, ok := s.Body.List[0].(*ast.ReturnStmt)
+				if !ok || len(r.Results) != 1 {
+					continue
+				}
+				if r, ok := r.Results[0].(*ast.Ident); !ok || r.Name != id.Name {
+					continue
+				}
+
+				// return nil
+				r, ok = v.List[i+1].(*ast.ReturnStmt)
+				if !ok || len(r.Results) != 1 {
+					continue
+				}
+				if r, ok := r.Results[0].(*ast.Ident); !ok || r.Name != "nil" {
+					continue
+				}
+
+				// check if there are any comments explaining the construct, don't emit an error if there are some.
+				if f.containsComments(s.Pos(), r.Pos()) {
+					continue
+				}
+
+				f.errorf(v.List[i], 0.9, "redundant if ...; err != nil check, just return error instead.")
 			}
 		}
 		return true
@@ -1515,14 +1606,23 @@ func isPkgDot(expr ast.Expr, pkg, name string) bool {
 	return ok && isIdent(sel.X, pkg) && isIdent(sel.Sel, name)
 }
 
-func isZero(expr ast.Expr) bool {
-	lit, ok := expr.(*ast.BasicLit)
-	return ok && lit.Kind == token.INT && lit.Value == "0"
-}
-
 func isOne(expr ast.Expr) bool {
 	lit, ok := expr.(*ast.BasicLit)
 	return ok && lit.Kind == token.INT && lit.Value == "1"
+}
+
+func isCgoExported(f *ast.FuncDecl) bool {
+	if f.Recv != nil || f.Doc == nil {
+		return false
+	}
+
+	cgoExport := regexp.MustCompile(fmt.Sprintf("(?m)^//export %s$", regexp.QuoteMeta(f.Name.Name)))
+	for _, c := range f.Doc.List {
+		if cgoExport.MatchString(c.Text) {
+			return true
+		}
+	}
+	return false
 }
 
 var basicTypeKinds = map[types.BasicKind]string{
