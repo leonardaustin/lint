@@ -7,7 +7,7 @@ Golint is a linter for Go source code.
 Golint requires a
 [supported release of Go](https://golang.org/doc/devel/release.html#policy).
 
-    go get -u golang.org/x/lint/golint
+    go get -u github.com/leonardaustin/lint/golint
 
 To find out where `golint` was installed you can run `go list -f {{.Target}} golang.org/x/lint/golint`. For `golint` to be used globally add that directory to the `$PATH` environment setting.
 
